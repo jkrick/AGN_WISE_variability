@@ -112,8 +112,14 @@ from fluxconversions import mjd_to_jd
 
 ```{code-cell} ipython3
 #access structure of light curves made in the light curve notebook
+# has CLAGN & SDSS small sample, all bands
+#https://drive.google.com/file/d/13RiPODiz2kI8j1OKpP1vfh6ByIUNsKEz/view?usp=share_link
 
-df_lc = pd.read_parquet("./output/df_lc_WISE_W1_AGN.parquet")
+gdd.download_file_from_google_drive(file_id='13RiPODiz2kI8j1OKpP1vfh6ByIUNsKEz',
+                                    dest_path='./data/df_lc_458sample.parquet',
+                                    unzip=True)
+
+df_lc = pd.read_parquet("./data/df_lc_458sample.parquet")
 
 #get rid of indices set in the light curve code and reset them as needed before sktime algorithms
 df_lc = df_lc.reset_index()  
@@ -127,27 +133,38 @@ This dataset needs significant work before it can be fed into a ML algorithm
 df_lc
 ```
 
+### 2.1 Remove bands with not enough data
+For this use case of CLAGN classification, we don't need to include some of the bands
+that are known to be sparse.
+
 ```{code-cell} ipython3
-#what do these light curves look like?
-ob_of_interest = 4
-singleob4 = df_lc[df_lc['objectid'] == ob_of_interest]
-ax1 = singleob4.plot(x = "time", y = "flux")
-
-
-ob_of_interest = 5
-singleob5 = df_lc[df_lc['objectid'] == ob_of_interest]
-singleob5.plot(x = "time", y = "flux", ax = ax1)
-
-ob_of_interest = 6
-singleob6 = df_lc[df_lc['objectid'] == ob_of_interest]
-singleob6.plot(x = "time", y = "flux", ax = ax1)
+##what are the unique set of bands included in our light curves
+df_lc.band.unique()
 ```
 
 ```{code-cell} ipython3
-df_lc.hist(column = "time", bins = 50)
+# get rid of some of the bands that don't have enough data for all the sources
+
+bands_to_drop = ["IceCube", "TESS", "FERMIGTRIG", "K2"]
+df_lc = df_lc[~df_lc["band"].isin(bands_to_drop)]
 ```
 
-### 2.1 Remove "bad"  data
+### 2.2 Combine Labels for a Simpler Classification
+All CLAGN start in the dataset as having labels based on their discovery paper.  Because we want one sample with all known CLAGN, change those discoery names to be simply "CLAGN" for all CLAGN, regardless of origin
+
+```{code-cell} ipython3
+df_lc['label'] = df_lc.label.str.replace('MacLeod 16', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('LaMassa 15', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('Yang 18', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('Lyu 21', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('Hon 22', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('Sheng 20', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('MacLeod 19', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('Green 22', 'CLAGN')
+df_lc['label'] = df_lc.label.str.replace('Lopez-Navas 22', 'CLAGN')
+```
+
+### 2.3 Remove "bad"  data
 "bad" includes:
 - errant values
 - NaNs
@@ -305,6 +322,13 @@ df_lc = df_lc.drop(df_lc.query(querystring).index)
 sigmaclip_value = 10.0
 df_lc = sigmaclip_lightcurves(df_lc, sigmaclip_value, include_plot = True)
 
+#remove objects without W1 fluxes
+#We want to normalize all light curves by W1, so we neeed to remove those 
+#without W1 fluxes as there will be nothing to normalize those light curves 
+#with and we don't want to have un-normalized data or data that has been 
+#normalized by a different band.  
+df_lc = remove_objects_without_band(df_lc, 'w1', verbose=True)
+
 #remove incomplete data
 #Some bands in some objects have only a few datapoints. Three data points 
 #is not large enough for KNN interpolation, so we will consider any array 
@@ -316,7 +340,149 @@ df_lc = remove_incomplete_data(df_lc, threshold_too_few)
     
 ```
 
-### 2.2  Make all objects and bands have identical time arrays (uniform length and spacing)
+### 2.4 Missing Data
+Some objects do not have light curves in all bands.  Some ML algorithms can handle mising data, but not all, so it would be useful to handle this missing data up front.
+
+There are two options here
+1) We will add light curves with zero flux and err values for the missing data.  SKtime does not like NaNs, so we chose zeros.
+2) Remove bands which have less data from all objects so that there are no objects with missing data
+
+Functions are inlcuded for both options (for now)
+
+```{code-cell} ipython3
+def make_zero_light_curve(oid, band, label):
+    """
+    Make placeholder light curves with flux and err values = 0.0.
+       
+    Parameters
+    ----------
+    oid: Int
+        objectid
+    band: string
+        photometric band name
+    label: string
+        value for ML algorithms which details what kind of object this is
+        
+    Returns
+    --------
+    zerosingle: dictionary with light curve info
+        
+    """
+    #randomly choose some times during the WISE survey
+    #these will all get fleshed out in the section on making uniform length time arrays
+    #so the specifics are not important now
+    timelist = [55230.0,57054.0, 57247.0, 57977.0, 58707.0]  
+    
+    #make a dictionary to hold the light curve
+    zerosingle = {"objectid": oid, "label": label, "band": band, "time": timelist, 
+                  "flux": np.zeros(len(timelist)), "err":np.zeros(len(timelist))}
+    
+    return zerosingle
+```
+
+```{code-cell} ipython3
+def missingdata_to_zeros(df_lc):
+    """
+    Convert mising data into zero fluxes and uncertainties
+       
+    Parameters
+    ----------
+    df_lc: Pandas dataframe with light curve info
+
+    Returns
+    --------
+    df_lc: MultiIndexDFObject with all  light curves
+        
+    """
+    #what is the full set of unique band names?
+    full_bandname = df_lc.band.unique()
+
+    #setup a list to store empty light curves
+    zerosingle_list = [] 
+
+    #for each object in each band
+    for oid , singleoid in df_lc.groupby("objectid"):
+                                  
+        #this is the list of bandnames for that object                                
+        oid_bandname = singleoid.band.unique()
+    
+        #figure out which bands are missing
+        missing = list(set(full_bandname).difference(oid_bandname))
+    
+        #if it is not the complete list, ie some bandnames are missing:                            
+        if len(missing) > 0:
+    
+            #make new dataframe for this object with zero flux and err values
+            for band in missing:
+                label = str(singleoid.label.unique().squeeze())
+                zerosingle = make_zero_light_curve(oid, band, label)
+                #keep track of these empty light curces in a list
+                zerosingle_list.append(zerosingle)
+    
+    #turn the empty light curves into a dataframe
+    df_empty = pd.DataFrame(zerosingle_list)
+    # df_empty has one row per dict. time,flux, and err columns store arrays.
+    # "explode" the dataframe to get one row per light curve point. time, flux, and err columns will now store floats.
+    df_empty = df_empty.explode(["time", "flux","err"], ignore_index=True)
+    df_empty = df_empty.astype({col: "float" for col in ["time", "flux", "err"]})
+
+
+    #now put the empty light curves back together with the main light curve dataframe
+    zeros_df_lc = pd.concat([df_lc, df_empty])
+
+    return(zeros_df_lc)
+```
+
+```{code-cell} ipython3
+def missingdata_drop_bands(df_lc, verbose = False):
+    """
+    Drop bands with the most missing data and objects without all remaining bands so that there is no missing data going forward.
+       
+    Parameters
+    ----------
+    df_lc: Pandas dataframe with light curve info
+    
+    verbose: bool
+    
+    Returns
+    --------
+    df_lc: MultiIndexDFObject with all  light curves
+        
+    """
+
+    #try instead to require that all objects have bands = df_lc.band.unique()
+
+    #first drop the bands not included from all objects
+    bands_to_drop = ['zi', 'Gaia g', 'Gaia bp', 'Gaia rp']
+    drop_df_lc = df_lc[~df_lc["band"].isin(bands_to_drop)]
+    
+    #now a list of all remaining bands that we want to keep
+    bands_to_keep = drop_df_lc.band.unique()
+    
+    if verbose:
+        #how many objects did we start with?
+        print(drop_df_lc.groupby(["objectid"]).ngroups, "n objects before removing missing band data")
+
+    # Identify objects with all bands that we want to keep
+    complete_objects = drop_df_lc.groupby('objectid')['band'].apply(lambda x: set(x) == set(bands_to_keep))
+
+    # Filter the DataFrame based on complete objects
+    filter_df_lc = drop_df_lc[drop_df_lc['objectid'].isin(complete_objects[complete_objects].index)]
+
+    if verbose:
+        # How many objects are left?
+        print(filter_df_lc.groupby(["objectid"]).ngroups, "n objects after removing missing band data")
+
+    return(filter_df_lc)
+```
+
+```{code-cell} ipython3
+#choose what to do with missing data...
+#df_lc = missingdata_to_zeros(df_lc)
+df_lc = missingdata_drop_bands(df_lc, verbose = True)
+```
+
+### 2.5  Make all objects and bands have identical time arrays (uniform length and spacing)
 
 It is very hard to find time-domain ML algorithms which can handle non uniform length datasets. Therefore we make them uniform using Pandas [reindex](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.reindex.html) which fills in the uniform length arrays with values according to the method chosen by the user.  We implement a nearest neighbor to fill the arrays.  
 
@@ -415,7 +581,7 @@ def uniform_length_spacing(df_lc, final_freq_interpol, include_plot = True):
 
 ```{code-cell} ipython3
 #change this to change the frequency of the time array
-final_freq_interpol = 180  #this is the timescale of interpolation in units of days
+final_freq_interpol = 30  #this is the timescale of interpolation in units of days
 
 df_interpol = uniform_length_spacing(df_lc, final_freq_interpol )
 # df_lc_interpol has one row per dict in lc_interpol. time and flux columns store arrays.
@@ -424,7 +590,7 @@ df_lc = df_interpol.explode(["time", "flux","err"], ignore_index=True)
 df_lc = df_lc.astype({col: "float" for col in ["time", "flux", "err"]})
 ```
 
-### 2.3  Restructure dataframe 
+### 2.6  Restructure dataframe 
 - Make columns have band names in them and then remove band from the index
 - pivot the dataframe so that SKTIME understands its format
 - this will put it in the format expected by sktime
@@ -455,7 +621,7 @@ singleob = df_lc[df_lc['objectid'] == ob_of_interest]
 singleob
 ```
 
-### 2.4 Normalize 
+### 2.7 Normalize 
 - this is normalizing across all bands
 - think this is the right place to do this, rather than interpolate over time 
     so that the final light curves are normalized since that is the chunk of information 
@@ -469,7 +635,7 @@ Idea here is that we normalize across each object.  So the algorithms will know,
 
 ```{code-cell} ipython3
 # make a new column with max_r_flux for each objectid
-df_lc['max_W1'] = df_lc.groupby('objectid', sort=False)["flux_W1"].transform('max')
+df_lc['max_W1'] = df_lc.groupby('objectid', sort=False)["flux_w1"].transform('max')
 
 #figure out which columns in the dataframe are flux columns
 flux_cols = [col for col in df_lc.columns if 'flux' in col]
@@ -481,7 +647,7 @@ df_lc[flux_cols] = df_lc[flux_cols].div(df_lc['max_W1'], axis=0)
 df_lc.drop(columns = ['max_W1'], inplace = True)
 ```
 
-### 2.5 Make datetime column
+### 2.8 Make datetime column
 https://docs.python.org/3/library/datetime.html#module-datetime
 
 SKTime wants a datetime column
@@ -501,31 +667,20 @@ t = Time(jd, format = 'jd' )
 df_lc['datetime'] = t.datetime
 ```
 
-```{code-cell} ipython3
-#what do these light curves look like?
-ob_of_interest = 4
-singleob = df_lc[df_lc['objectid'] == ob_of_interest]
-singleob.plot(x = "time", y = "flux_W1")
-```
-
-```{code-cell} ipython3
-singleob.label
-```
-
-### 2.6 Make into multi-index
-(which is what SKTime expects as input)
-
-```{code-cell} ipython3
-df_lc = df_lc.set_index(["objectid", "label", "datetime"])
-```
-
-### 2.7 Save this dataframe
+### 2.9 Save this dataframe
 
 ```{code-cell} ipython3
 #save this dataframe to use for the ML below so we don't have to make it every time
 parquet_savename = 'output/df_lc_ML.parquet'
 df_lc.to_parquet(parquet_savename)
 #print("file saved!")
+```
+
+### 2.10 Make into multi-index
+(which is what SKTime expects as input)
+
+```{code-cell} ipython3
+df_lc = df_lc.set_index(["objectid", "label", "datetime"])
 ```
 
 ## 3. Prep for ML algorithms
@@ -540,15 +695,11 @@ df_lc.to_parquet(parquet_savename)
 
 ```{code-cell} ipython3
 #try dropping the uncertainty columns as variables for sktime
-df_lc.drop(columns = ['err_W1'], inplace = True)
-```
+df_lc.drop(columns = ['err_panstarrs_g',	'err_panstarrs_i',	'err_panstarrs_r',	'err_panstarrs_y',	
+                      'err_panstarrs_z',	'err_w1',	'err_w2',	'err_zg',	'err_zr'], inplace = True)
 
-```{code-cell} ipython3
-df_lc
-```
-
-```{code-cell} ipython3
-
+#drop also the time column because that shouldn't be a feature
+df_lc.drop(columns = ['time'],inplace = True)
 ```
 
 ### 3.0 Consider data augmentation
@@ -588,6 +739,10 @@ test_df = df_lc.loc[test_ix]
 ```
 
 ```{code-cell} ipython3
+y
+```
+
+```{code-cell} ipython3
 print(train_df.groupby([ "objectid"]).ngroups, "n groups in train sample")
 print(test_df.groupby(["objectid"]).ngroups, "n groups in test sample")
 ```
@@ -612,6 +767,11 @@ y_train = train_df.droplevel('datetime').index.unique().get_level_values('label'
 y_test = test_df.droplevel('datetime').index.unique().get_level_values('label').to_series()
 ```
 
+```{code-cell} ipython3
+print(X_train.groupby([ "objectid"]).ngroups, "n groups in train sample")
+print(X_test.groupby(["objectid"]).ngroups, "n groups in test sample")
+```
+
 ## 4. Run sktime algorithms on the light curves
 
 We choose to use [sktime](https://www.sktime.net/en/stable/index.html) algorithms beacuse it is a library of many algorithms specifically tailored to time series datasets.  It is based on the sklearn library so syntax is familiar to many users.
@@ -625,19 +785,20 @@ This notebook will invert the actual workflow and show you a single example of t
 ### 4.1 Check that the data types are ok for sktime
 
 ```{code-cell} ipython3
-#drop  the time column because that shouldn't be a feature
-X_train_sktime = X_train.drop(columns = ['time'])
-X_test_sktime = X_test.drop(columns = ['time'])
-```
-
-```{code-cell} ipython3
 #ask sktime if it likes the data type of X_train
 from sktime.datatypes import check_is_mtype
 
-check_is_mtype(X_train_sktime, mtype="pd-multiindex", scitype="Panel", return_metadata=True)
-#check_is_mtype(X_test_sktime, mtype="pd-multiindex", scitype="Panel", return_metadata=True)
+check_is_mtype(X_train, mtype="pd-multiindex", scitype="Panel", return_metadata=True)
+#check_is_mtype(X_test, mtype="pd-multiindex", scitype="Panel", return_metadata=True)
 
 #This test needs to pass in order for sktime to run
+```
+
+```{code-cell} ipython3
+#what is the list of all possible classifiers that work with multivariate data
+#all_tags(estimator_types = 'classifier')
+#classifiers = all_estimators("classifier", filter_tags={'capability:multivariate':True})
+#classifiers
 ```
 
 ### 4.1 A single Classifier
@@ -651,10 +812,10 @@ See section 4.3 for how we landed with this algorithm
 clf = RandomIntervalClassifier(n_intervals = 12, n_jobs = -1, random_state = 43)
 
 #fit the classifier on the training dataset
-clf.fit(X_train_sktime, y_train)
+clf.fit(X_train, y_train)
 
 #make predictions on the test dataset using the trained model 
-y_pred = clf.predict(X_test_sktime)
+y_pred = clf.predict(X_test)
 
 print(f"Accuracy of Random Interval Classifier: {accuracy_score(y_test, y_pred)}\n", flush=True)
 
@@ -670,7 +831,7 @@ plt.show()
 
 Our method is to do a cursory check of a bunch of classifiers and then later drill down deeper on anything with good initial results.  We choose to run a loop over ~10 classifiers that seem promising and check the accuracy scores for each one.  Any classifier with a promising accuracy score could then be followed up with detailed hyperparameter tuning, or potentially with considering other classifiers in that same type.
 
-```{code-cell} ipython3
+```{raw-cell}
 %%time
 #This cell is currently not being run because it takes a while so is not good for testing/debugging
 
@@ -678,16 +839,16 @@ Our method is to do a cursory check of a bunch of classifiers and then later dri
 #roughly one from each type of classifier
 
 names = ["Arsenal",                     #kernel based
-#        "RocektClassifier",             #kernel based
-#        "CanonicalIntervalForest",      #interval based
-#        "HIVECOTEV2",                   #hybrid
+        "RocektClassifier",             #kernel based
+        "CanonicalIntervalForest",      #interval based
+        "HIVECOTEV2",                   #hybrid
 #        "CNNClassifier",               #Deep Learning  - **requires tensorflow which is giving import errors
 #        "WeightedEnsembleClassifier",   #Ensemble - **maybe use in the future if we find good options
-#        "IndividualTDE",               #Dictionary-based
-#        "KNeighborsTimeSeriesClassifier", #Distance Based
-#        "RandomIntervalClassifier",     #Feature based
-#        "Catch22Classifier",            #Feature based
- #       "ShapeletTransformClassifier"   #Shapelet based
+        "IndividualTDE",               #Dictionary-based
+        "KNeighborsTimeSeriesClassifier", #Distance Based
+        "RandomIntervalClassifier",     #Feature based
+        "Catch22Classifier",            #Feature based
+        "ShapeletTransformClassifier"   #Shapelet based
         "DummyClassifier"]             #Dummy - ignores input
 
 #for those with an impossible time limit, how long to let them run for before cutting off
@@ -695,54 +856,34 @@ nmins = 10
 
 #these could certainly be more tailored
 classifier_call = [Arsenal(time_limit_in_minutes=nmins, n_jobs = -1), 
-#                  RocketClassifier(num_kernels=2000),
-#                  CanonicalIntervalForest(n_jobs = -1),
-#                  HIVECOTEV2(time_limit_in_minutes=nmins, n_jobs = -1),
+                  RocketClassifier(num_kernels=2000),
+                  CanonicalIntervalForest(n_jobs = -1),
+                  HIVECOTEV2(time_limit_in_minutes=nmins, n_jobs = -1),
 #                  CNNClassifier(),
 #                  WeightedEnsembleClassifier(),
-#                  IndividualTDE(n_jobs=-1),
-#                  KNeighborsTimeSeriesClassifier(n_jobs = -1),
-#                  RandomIntervalClassifier(n_intervals = 20, n_jobs = -1, random_state = 43),
-#                  Catch22Classifier(outlier_norm = True, n_jobs = -1, random_state = 43),
-#                  ShapeletTransformClassifier(time_limit_in_minutes=nmins,n_jobs = -1),
+                  IndividualTDE(n_jobs=-1),
+                  KNeighborsTimeSeriesClassifier(n_jobs = -1),
+                  RandomIntervalClassifier(n_intervals = 20, n_jobs = -1, random_state = 43),
+                  Catch22Classifier(outlier_norm = True, n_jobs = -1, random_state = 43),
+                  ShapeletTransformClassifier(time_limit_in_minutes=nmins,n_jobs = -1),
                   DummyClassifier()]
 
 #setup to store the accuracy scores
 accscore_dict = {}
-MCC_dict ={}
-homogeneity_dict = {}
-completeness_dict = {}
-f1_dict = {}
 
 # iterate over classifiers
 for name, clf in tqdm(zip(names, classifier_call)):
     #fit the classifier
-    clf.fit(X_train_sktime, y_train)
+    clf.fit(X_train, y_train)
     
     #make predictions on the test dataset
-    y_pred = clf.predict(X_test_sktime)
+    y_pred = clf.predict(X_test)
 
     #calculate and track accuracy score
     accscore = accuracy_score(y_test, y_pred)
     print(f"Accuracy of {name} classifier: {accscore}\n", flush=True)
     accscore_dict[name] = accscore
-
-    MCC = matthews_corrcoef(y_test, y_pred)
-    print(f"MCC of {name} classifier: {MCC}\n", flush=True)
-    MCC_dict[name] = MCC
-
-    completeness = completeness_score(y_test, y_pred)
-    print(f"Completeness of {name} classifier: {completeness}\n", flush=True)
-    completeness_dict[name] = completeness
     
-    homogeneity = homogeneity_score(y_test, y_pred)
-    print(f"Homogeneity of {name} classifier: {homogeneity}\n", flush=True)
-    homogeneity_dict[name] = homogeneity
-    
-    f1 = f1_score(y_test, y_pred, average='macro')
-    print(f"F1 score of {name} classifier: {f1}\n", flush=True)
-    f1_dict[name] = f1
-
     #plot confusion matrix
     cm = confusion_matrix(y_test, y_pred, labels=clf.classes_)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm,display_labels=clf.classes_)
@@ -754,9 +895,9 @@ for name, clf in tqdm(zip(names, classifier_call)):
 #this fails to complete, and is a known limitation of this algorithm.  
 ```
 
-```{code-cell} ipython3
+```{raw-cell}
 #show the summary of the algorithms used and their accuracy score
-accscore_dict, MCC_dict, completeness_dict, homogeneity_dict, f1_dict
+accscore_dict
 ```
 
 ```{raw-cell}
@@ -771,12 +912,6 @@ json.dump( homogeneity_dict, open( "output/homogeneity.json", 'w' ) )
 #accscore_dict = json.load( open( "output/accscore.json") )
 ```
 
-## For reference from Faisst et al., 2019
-SOM ACC = 0.94, MCC = 0.72, F1 = 0.75, purity = 86%, completeness = 66%
-MLP ACC = 0.94, MCC = 0.65, F1 = 0.67, purity = 79%, completeness = 58%
-
-+++
-
 ## 5.0 Run pyts algorithms on a single band of the light curves
 [pyts](https://pyts.readthedocs.io/en/stable/) is a python package for time series classification.
 
@@ -785,6 +920,13 @@ We run univariate classification here with just the W1 WISE band.  This is a cha
 +++
 
 ### 5.1 Get the data into the correct shape for pyTS
+
+```{code-cell} ipython3
+#How many objects are we working with?
+#this is repeated here in case sktime is not run above.
+print(X_train.groupby([ "objectid"]).ngroups, "n groups in train sample")
+print(X_test.groupby(["objectid"]).ngroups, "n groups in test sample")
+```
 
 ```{code-cell} ipython3
 #input to pyTS must be a  numpy.ndarray 
@@ -796,8 +938,8 @@ X_train_pyts = X_train.reset_index()
 X_test_pyts = X_test.reset_index()
 
 # Extract univariate flux values into NumPy arrays and reshape them
-X_train_np = X_train_pyts.pivot(index='objectid',  columns='time',values='flux_W1').to_numpy() 
-X_test_np = X_test_pyts.pivot(index='objectid', columns='time', values='flux_W1').to_numpy()
+X_train_np = X_train_pyts.pivot(index='objectid',  columns='time',values='flux_w1').to_numpy() 
+X_test_np = X_test_pyts.pivot(index='objectid', columns='time', values='flux_w1').to_numpy()
 
 #now work on the y
 train_df_pyts = train_df.reset_index()
@@ -820,7 +962,6 @@ f1_dict = {}
 ```
 
 ```{code-cell} ipython3
-%%time
 clf = LearningShapelets(random_state=42, tol=0.01)
 clf.fit(X_train_np, y_train_np)
 clf.score(X_test_np, y_test_np)
@@ -855,16 +996,18 @@ f1_dict[name] = f1
 
 ### 5.3 Loop over a bunch of classifiers
 
-```{code-cell} ipython3
+```{raw-cell}
 %%time
-#This cell takes MM to run
+#This cell is currently not being run because it takes a while so is not good for testing/debugging
 
-names = ["saxvsm","bossvs","timeseriesforest"]
+names = ["KNNDTW","saxvsm","bossvs", "learningshapelets","timeseriesforest"]
          
 
 #these could certainly be more tailored
-classifier_call = [SAXVSM(window_size=10, sublinear_tf=False, use_idf=False),
-                   BOSSVS(window_size=10),
+classifier_call = [KNeighborsClassifier(metric='dtw'), 
+                   SAXVSM(window_size=34, sublinear_tf=False, use_idf=False),
+                   BOSSVS(window_size=28),
+                   LearningShapelets(random_state=43, tol=0.01),
                    TimeSeriesForest(random_state=43)]
                    
 #setup to store the accuracy scores
@@ -882,22 +1025,6 @@ for name, clf in tqdm(zip(names, classifier_call)):
     accscore = accuracy_score(y_test_np, y_pred)
     print(f"Accuracy of {name} classifier: {accscore}\n", flush=True)
     accscore_dict[name] = accscore
-    
-    MCC = matthews_corrcoef(y_test, y_pred)
-    print(f"MCC of {name} classifier: {MCC}\n", flush=True)
-    MCC_dict[name] = MCC
-    
-    completeness = completeness_score(y_test, y_pred)
-    print(f"Completeness of {name} classifier: {completeness}\n", flush=True)
-    completeness_dict[name] = completeness
-    
-    homogeneity = homogeneity_score(y_test, y_pred)
-    print(f"Homogeneity of {name} classifier: {homogeneity}\n", flush=True)
-    homogeneity_dict[name] = homogeneity
-    
-    f1 = f1_score(y_test, y_pred, average='macro')
-    print(f"F1 score of {name} classifier: {f1}\n", flush=True)
-    f1_dict[name] = f1
     
     #plot confusion matrix
     cm = confusion_matrix(y_test, y_pred, labels=clf.classes_)
