@@ -4,11 +4,11 @@ jupytext:
     extension: .md
     format_name: myst
     format_version: 0.13
-    jupytext_version: 1.16.0
+    jupytext_version: 1.15.2
 kernelspec:
-  display_name: science_demo
+  display_name: Python 3 (ipykernel)
   language: python
-  name: conda-env-science_demo-py
+  name: python3
 ---
 
 # Make Multiwavelength Light Curves Using Archival Data
@@ -92,7 +92,7 @@ from TESS_Kepler_functions import TESS_Kepler_get_lightcurves
 # Note: WISE and ZTF data are temporarily located in a non-public AWS S3 bucket. It is automatically
 # available from the Fornax SMCE, but will require user credentials for access outside the SMCE.
 from WISE_functions import WISE_get_lightcurves
-from ztf_functions import ZTF_get_lightcurve
+#from ztf_functions import ZTF_get_lightcurve
 ```
 
 ## 1. Define the sample
@@ -117,7 +117,7 @@ labels = []
 #get_lyu_sample(coords, labels)  #z32022ApJ...927..227L
 #get_lopeznavas_sample(coords, labels)  #2022MNRAS.513L..57L
 #get_hon_sample(coords, labels)  #2022MNRAS.511...54H
-get_yang_sample(coords, labels)   #2018ApJ...862..109Y
+#get_yang_sample(coords, labels)   #2018ApJ...862..109Y
 
 # Get some "normal" QSOs 
 # there are ~500K of these, so choose the number based on
@@ -126,10 +126,39 @@ get_yang_sample(coords, labels)   #2018ApJ...862..109Y
 
 #num_normal_QSO = 5000
 #get_SDSS_sample(coords, labels, num_normal_QSO)
+from astropy.coordinates import SkyCoord
+from astropy.table import Table, join, join_skycoord, unique
+
+def map_to_label(value):
+  if value > 0.1:
+    #print("value > 0.1", value)
+    return "variable"
+  else:
+    return "not-variable"
+
+
+def get_WISE_AGN_sample(coords, labels, verbose = 1):
+    WISE_AGN = pd.read_csv('data/WISE_AGN_STAT.csv')
+    WISE_AGN_coords = [SkyCoord(ra, dec, frame='icrs', unit='deg') for ra, dec in zip(WISE_AGN['WISE_RA'], WISE_AGN['WISE_Dec'])]
+
+    # Apply the mapping function to create a new column
+    WISE_AGN['labels'] = WISE_AGN['VIS_VAR_AGN'].apply(map_to_label)
+    coords.extend(WISE_AGN_coords)
+    labels.extend(WISE_AGN['labels'])
+    if verbose:
+        print('Number of WISE variables: ',len(WISE_AGN['WISE_RA']))
+
+get_WISE_AGN_sample(coords, labels)
+
 
 # Remove duplicates, attach an objectid to the coords,
 # convert to astropy table to keep all relevant info together
 sample_table = clean_sample(coords, labels)
+```
+
+```{code-cell} ipython3
+import matplotlib.pyplot as plt
+plt.hist(labels)
 ```
 
 ### 1.1 Build your own sample
@@ -448,7 +477,7 @@ This work made use of:
 &bull; Astropy; Astropy Collaboration 2022, Astropy Collaboration 2018, Astropy Collaboration 2013,    2022ApJ...935..167A, 2018AJ....156..123A, 2013A&A...558A..33A  
 &bull; Lightkurve; Lightkurve Collaboration 2018, 2018ascl.soft12013L  
 &bull; acstools; https://zenodo.org/record/7406933#.ZBH1HS-B0eY  
-&bull; unWISE light curves; Meisner et al., 2023, 2023AJ....165...36M  
+&bull; unWISE light curves; Meisner et al., 2023, 2023AJ....165...36M
 
 ```{code-cell} ipython3
 
